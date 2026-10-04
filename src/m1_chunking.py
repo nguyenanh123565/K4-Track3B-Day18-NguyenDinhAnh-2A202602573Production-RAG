@@ -11,6 +11,7 @@ Test: pytest tests/test_m1.py
 
 import os, sys, glob, re
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -92,20 +93,31 @@ def chunk_semantic(text: str, threshold: float = SEMANTIC_THRESHOLD,
     Split text by sentence similarity — nhóm câu cùng chủ đề.
     Tốt hơn basic vì không cắt giữa ý.
     """
-    # TODO: Implement semantic chunking
-    # 1. from sentence_transformers import SentenceTransformer
-    #    from numpy import dot
-    #    from numpy.linalg import norm
-    # 2. metadata = metadata or {}
-    # 3. Split text thành sentences: re.split(r'(?<=[.!?])\s+|\n\n', text)
-    # 4. model = SentenceTransformer("all-MiniLM-L6-v2")
-    #    embeddings = model.encode(sentences)
-    # 5. cosine_sim(a, b) = dot(a, b) / (norm(a) * norm(b) + 1e-9)
-    # 6. Duyệt từ sentence[1]:
-    #      - sim(embedding[i-1], embedding[i]) < threshold → tách chunk mới
-    #      - else: gộp vào chunk hiện tại
-    # 7. Return [Chunk(text=joined_group, metadata={..., "strategy": "semantic"})]
-    return []
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+|\n\n', text) if s.strip()]
+    if not sentences:
+        return []
+    groups = [[sentences[0]]]
+    if len(sentences) > 1:
+        from numpy import dot
+        from numpy.linalg import norm
+        embeddings = _get_semantic_model().encode(sentences)
+        for i in range(1, len(sentences)):
+            a, b = embeddings[i - 1], embeddings[i]
+            denominator = float(norm(a) * norm(b))
+            similarity = float(dot(a, b)) / denominator if denominator else 0.0
+            if similarity < threshold:
+                groups.append([])
+            groups[-1].append(sentences[i])
+    return [Chunk(text=" ".join(group), metadata={**(metadata or {}),
+                  "strategy": "semantic", "chunk_index": i})
+            for i, group in enumerate(groups)]
+
+
+@lru_cache(maxsize=1)
+def _get_semantic_model():
+    """Load once, lazily, and reuse the encoder across documents."""
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer("all-MiniLM-L6-v2")
 
 
 # ─── Strategy 2: Hierarchical Chunking ──────────────────
@@ -121,16 +133,43 @@ def chunk_hierarchical(text: str, parent_size: int = HIERARCHICAL_PARENT_SIZE,
     Returns:
         (parents, children) — mỗi child có parent_id link đến parent.
     """
-    # TODO: Implement hierarchical chunking
-    # 1. metadata = metadata or {}
-    # 2. Split text bằng "\n\n" → paragraphs
-    # 3. Gộp paragraphs thành parent chunks (mỗi parent ≤ parent_size chars):
-    #      pid = f"parent_{len(parents)}"
-    #      parents.append(Chunk(text=..., metadata={..., "chunk_type": "parent", "parent_id": pid}))
-    # 4. Mỗi parent → split thành children (mỗi child ≤ child_size chars):
-    #      children.append(Chunk(text=..., metadata={..., "chunk_type": "child"}, parent_id=pid))
-    # 5. return (parents, children)
-    return ([], [])
+    if parent_size <= 0 or child_size <= 0:
+        raise ValueError("parent_size and child_size must be positive")
+    parents: list[Chunk] = []
+    children: list[Chunk] = []
+    for i, parent_text in enumerate(_split_bounded(text, parent_size)):
+        pid = f"parent_{i}"
+        parents.append(Chunk(text=parent_text, metadata={**(metadata or {}),
+            "chunk_type": "parent", "parent_id": pid, "chunk_index": i}))
+        for child_text in _split_bounded(parent_text, child_size):
+            children.append(Chunk(text=child_text, metadata={**(metadata or {}),
+                "chunk_type": "child", "parent_id": pid,
+                "chunk_index": len(children)}, parent_id=pid))
+    return parents, children
+
+
+def _split_bounded(text: str, size: int) -> list[str]:
+    """Split at paragraph, sentence or word boundaries, hard-cutting long tokens."""
+    pieces: list[str] = []
+    remaining = text.strip()
+    while remaining:
+        if len(remaining) <= size:
+            if remaining.strip():
+                pieces.append(remaining)
+            break
+        window = remaining[:size]
+        end = size
+        for pattern in (r"\n[ \t]*\n", r"(?<=[.!?])\s+", r"\s+"):
+            boundaries = [m.end() for m in re.finditer(pattern, window)
+                          if window[:m.end()].strip()]
+            if boundaries:
+                end = boundaries[-1]
+                break
+        piece = remaining[:end]
+        if piece.strip():
+            pieces.append(piece)
+        remaining = remaining[end:]
+    return pieces
 
 
 # ─── Strategy 3: Structure-Aware Chunking ────────────────
@@ -141,14 +180,36 @@ def chunk_structure_aware(text: str, metadata: dict | None = None) -> list[Chunk
     Parse markdown headers → chunk theo logical structure.
     Giữ nguyên tables, code blocks, lists — không cắt giữa chừng.
     """
-    # TODO: Implement structure-aware chunking
-    # 1. metadata = metadata or {}
-    # 2. sections = re.split(r'(^#{1,3}\s+.+$)', text, flags=re.MULTILINE)
-    # 3. Duyệt sections:
-    #      - Nếu match header (^#{1,3}\s+): lưu header hiện tại, tạo chunk cho content trước đó
-    #      - Else: gộp vào content hiện tại
-    # 4. Return [Chunk(text=header+content, metadata={..., "section": header, "strategy": "structure"})]
-    return []
+    chunks: list[Chunk] = []
+    section = ""
+    lines: list[str] = []
+    fence_char = ""
+    fence_length = 0
+
+    def emit() -> None:
+        content = "".join(lines).strip()
+        if content:
+            chunks.append(Chunk(text=content, metadata={**(metadata or {}),
+                "section": section, "strategy": "structure", "chunk_index": len(chunks)}))
+
+    for line in text.splitlines(keepends=True):
+        fence = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line.rstrip("\r\n"))
+        if fence:
+            marker, suffix = fence.groups()
+            if not fence_char:
+                fence_char, fence_length = marker[0], len(marker)
+            elif marker[0] == fence_char and len(marker) >= fence_length and not suffix.strip():
+                fence_char = ""
+            lines.append(line)
+            continue
+        heading = None if fence_char else re.match(r"^ {0,3}#{1,3}[ \t]+[^\r\n]+", line)
+        if heading:
+            emit()
+            section = heading.group().strip()
+            lines = []
+        lines.append(line)
+    emit()
+    return chunks
 
 
 # ─── A/B Test: Compare All Strategies ────────────────────

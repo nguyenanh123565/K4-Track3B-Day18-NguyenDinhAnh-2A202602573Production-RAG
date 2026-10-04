@@ -29,28 +29,31 @@ class CrossEncoderReranker:
 
     def _load_model(self):
         if self._model is None:
-            # TODO: Load cross-encoder model
-            # from sentence_transformers import CrossEncoder
-            # self._model = CrossEncoder(self.model_name)
-            #
-            # ⚠️ LƯU Ý: Dùng sentence_transformers.CrossEncoder, KHÔNG dùng FlagEmbedding.
-            # FlagReranker crash với transformers>=5.0 (XLMRobertaTokenizer lỗi).
-            pass
+            from sentence_transformers import CrossEncoder
+
+            self._model = CrossEncoder(self.model_name)
         return self._model
 
     def rerank(self, query: str, documents: list[dict], top_k: int = RERANK_TOP_K) -> list[RerankResult]:
         """Rerank documents: top-20 → top-k."""
-        # TODO: Implement reranking
-        # 1. if not documents: return []
-        # 2. model = self._load_model()
-        # 3. pairs = [(query, doc["text"]) for doc in documents]
-        # 4. scores = model.predict(pairs)
-        # 5. if isinstance(scores, (int, float)): scores = [scores]
-        # 6. scored = sorted(zip(scores, documents), key=lambda x: x[0], reverse=True)
-        # 7. Return [RerankResult(text=..., original_score=doc.get("score", 0.0),
-        #            rerank_score=float(score), metadata=..., rank=i)
-        #            for i, (score, doc) in enumerate(scored[:top_k])]
-        return []
+        if not documents or top_k <= 0:
+            return []
+
+        import numpy as np
+
+        model = self._load_model()
+        pairs = [(query, doc["text"]) for doc in documents]
+        # Normalize scalar, vector and (N, 1) predictions to one score per doc.
+        scores = np.asarray(model.predict(pairs)).reshape(-1)
+        if len(scores) != len(documents):
+            raise ValueError("Cross-encoder must return one relevance score per document")
+        scored = sorted(zip(scores, documents), key=lambda item: float(item[0]),
+                        reverse=True)
+        return [RerankResult(text=doc["text"],
+                             original_score=float(doc.get("score", 0.0)),
+                             rerank_score=float(score),
+                             metadata=dict(doc.get("metadata", {})), rank=i)
+                for i, (score, doc) in enumerate(scored[:top_k])]
 
 
 class FlashrankReranker:
